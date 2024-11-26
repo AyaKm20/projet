@@ -1,0 +1,118 @@
+name: Build KVM Image with Packer
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select the environment (testing, development, production)"
+        required: true
+        default: "testing"
+permissions:
+  contents: write
+jobs:
+  build:
+    name: build-kvm-image
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+        # Step 2: Install Dependencies (Packer and QEMU)
+      - name: Install QEMU and KVM
+        run: |
+          sudo apt-get update
+          sudo apt -y install qemu-kvm libvirt-daemon  bridge-utils libvirt-daemon-system
+          sudo apt -y install vim libguestfs-tools libosinfo-bin  qemu-system virt-manager
+
+      - name: Install Packer
+        run: |
+          sudo apt-get install -y wget unzip
+          wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install packer
+          packer --version
+
+      - name: Verify installation
+        run: |
+          qemu-system-x86_64 --version
+          kvm --version
+          packer --version
+      # Step 3: Install Git LFS
+      - name: Install Git LFS
+        run: |
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+      # Step 4: Generate Cloud-Init Seed Image
+      - name: Generate cloud-init seed image
+        run: |
+          # Ensure cloud-image-utils is installed
+          sudo apt-get update
+          sudo apt-get install -y cloud-image-utils
+
+          # Set the environment dynamically
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+
+          if [ -z "$ENVIRONMENT" ]; then
+            echo "Warning: ENVIRONMENT is not set. Defaulting to 'testing'."
+            ENVIRONMENT="testing"
+          fi
+
+          # Define the cloud-init path and remove trailing slashes
+          CLOUD_INIT_PATH="packer/builders/kvm/cloud-init"
+          CLOUD_INIT_PATH="${CLOUD_INIT_PATH%/}" # Remove trailing slash if it exists
+          echo "CLOUD_INIT_PATH: $CLOUD_INIT_PATH"
+          echo "ENVIRONMENT: $ENVIRONMENT"
+          # Ensure the directory structure exists
+          mkdir -p "${CLOUD_INIT_PATH}/${ENVIRONMENT}"
+
+          # Verify required files exist before creating seed.img
+          if [ ! -f "${CLOUD_INIT_PATH}/${ENVIRONMENT}/user-data" ]; then
+              echo "Error: user-data file is missing in ${CLOUD_INIT_PATH}/${ENVIRONMENT}/"
+              exit 1
+          fi
+
+          if [ ! -f "${CLOUD_INIT_PATH}/${ENVIRONMENT}/meta-data" ]; then
+              echo "Error: meta-data file is missing in ${CLOUD_INIT_PATH}/${ENVIRONMENT}/"
+              exit 1
+          fi
+
+          # Generate the seed image
+          ls  "${CLOUD_INIT_PATH}/${ENVIRONMENT}"
+          cloud-localds "${CLOUD_INIT_PATH}/${ENVIRONMENT}/seed.img" \
+            "${CLOUD_INIT_PATH}/${ENVIRONMENT}/user-data" \
+            "${CLOUD_INIT_PATH}/${ENVIRONMENT}/meta-data"
+
+      # Step 5: Initialize Packer
+      - name: Initialize Packer
+        run: |
+          cd packer/builders/kvm
+          packer init .
+
+      # Step 6: Build the KVM Image
+      - name: Build KVM Image with Packer
+        run: |
+          export PACKER_LOG=1
+          ENVIRONMENT=${{ github.event.inputs.environment }}
+          mkdir -p output/kvm
+          sudo packer build -var "seed_image_path=packer/builders/kvm/cloud-init/$ENVIRONMENT/seed.img" \
+                       -var "output_directory=output/kvm/$ENVIRONMENT" \
+                       packer/builders/kvm
+
+      # Step 7: Commit and Push the Image
+      - name: Commit and Push the Image
+        run: |
+          ENVIRONMENT=${{ github.event.inputs.environment }}
+          TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+          IMAGE_NAME="ubuntu-kvm-${ENVIRONMENT}-${TIMESTAMP}.qcow2"
+          sudo mv output/kvm/$ENVIRONMENT/*.qcow2 output/kvm/$ENVIRONMENT/$IMAGE_NAME
+          git config user.name "youssef GHActions"
+          git config user.email "youssefmoustakim234@gmail.com"
+          git lfs install
+          git lfs track "output/kvm/$ENVIRONMENT/*.qcow2" 
+          git add .gitattributes
+          git add output/kvm/$ENVIRONMENT/$IMAGE_NAME
+          git commit -m "Add KVM image for $ENVIRONMENT: $IMAGE_NAME"
+          git push
